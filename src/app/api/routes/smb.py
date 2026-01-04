@@ -31,6 +31,28 @@ class SMBReportRequest(BaseModel):
     assets: List[str] = []
 
 
+class EmployeeData(BaseModel):
+    name: str
+    email: EmailStr
+    role: str
+
+
+class AssetData(BaseModel):
+    url: str
+    asset_type: str
+
+
+class SMBReportDataRequest(BaseModel):
+    company_name: str
+    industry: str
+    employee_count: str
+    contact_name: str
+    contact_email: EmailStr
+    security_priorities: List[str]
+    employees_data: List[EmployeeData]
+    assets_data: List[AssetData]
+
+
 class SMBReportResponse(BaseModel):
     report_id: str
     status: str
@@ -465,6 +487,78 @@ async def generate_smb_report_from_csv(
     os.makedirs("reports", exist_ok=True)
     pdf_path = f"reports/cybershield_{company_name.replace(' ', '_')}_{report_id}.pdf"
 
+    background_tasks.add_task(generate_pdf_report, pdf_path, report_data)
+
+    return {
+        "status": "success",
+        "report_id": report_id,
+        "download_url": f"/smb/download/{report_id}",
+        "summary": report_data["scan_summary"],
+        "message": "Report generation started",
+    }
+
+
+@router.post(
+    "/report/json",
+    summary="Generate SMB security report from JSON payload",
+    description="Accepts employee and asset lists (JSON), performs passive checks, and returns report metadata.",
+)
+async def generate_smb_report_from_json(payload: SMBReportDataRequest, background_tasks: BackgroundTasks):
+    if not payload.employees_data:
+        raise HTTPException(status_code=400, detail="At least one employee is required")
+    if not payload.assets_data:
+        raise HTTPException(status_code=400, detail="At least one asset is required")
+
+    email_results = []
+    for employee in payload.employees_data:
+        result = await check_email_breach(employee.email)
+        result["name"] = employee.name
+        result["role"] = employee.role
+        email_results.append(result)
+        await asyncio.sleep(0.2)
+
+    asset_results = []
+    for asset in payload.assets_data:
+        ssl_check, headers_check, vt_check = await asyncio.gather(
+            check_ssl_certificate(asset.url),
+            check_security_headers(asset.url),
+            check_malware_virustotal(asset.url, settings.VIRUSTOTAL_API_KEY),
+        )
+        asset_results.append(
+            {
+                "url": asset.url,
+                "type": asset.asset_type,
+                "ssl": ssl_check,
+                "headers": headers_check,
+                "malware": vt_check,
+            }
+        )
+        await asyncio.sleep(0.2)
+
+    report_data = {
+        "company_info": {
+            "name": payload.company_name,
+            "industry": payload.industry,
+            "employee_count": payload.employee_count,
+            "contact": payload.contact_name,
+            "email": payload.contact_email,
+            "security_priorities": payload.security_priorities,
+        },
+        "scan_summary": {
+            "total_employees": len(payload.employees_data),
+            "total_assets": len(payload.assets_data),
+            "breached_emails": sum(1 for e in email_results if e.get("is_breached")),
+            "insecure_assets": sum(1 for a in asset_results if not a["ssl"].get("has_ssl")),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "email_findings": email_results,
+        "asset_findings": asset_results,
+        "google_dorks": generate_google_dorks(payload.company_name),
+    }
+
+    report_id = str(uuid.uuid4())[:8]
+    os.makedirs("reports", exist_ok=True)
+    pdf_path = f"reports/cybershield_{payload.company_name.replace(' ', '_')}_{report_id}.pdf"
     background_tasks.add_task(generate_pdf_report, pdf_path, report_data)
 
     return {
