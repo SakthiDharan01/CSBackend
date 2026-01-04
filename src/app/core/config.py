@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     SMB_DEFAULT_RISK_LEVEL: str = "low"
     VIRUSTOTAL_API_KEY: str = ""
     HIBP_API_KEY: str = ""
+    CORS_ALLOW_ORIGINS: list[str] = ["*"]
+    CORS_ALLOW_METHODS: list[str] = ["*"]
+    CORS_ALLOW_HEADERS: list[str] = ["*"]
+    CORS_ALLOW_CREDENTIALS: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
