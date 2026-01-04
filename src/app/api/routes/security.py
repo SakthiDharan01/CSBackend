@@ -310,9 +310,28 @@ def email_security_score(payload: EmailSecurityRequest) -> SecurityScoreResponse
     checks = run_parallel_checks(payload.email)
     hibp_result = checks.get("hibp", hibp_email_breach(payload.email, settings.HIBP_API_KEY))
 
+    domain = extract_domain(payload.email)
+    tld = domain.rsplit(".", 1)[-1] if "." in domain else ""
+    free_domains = {
+        "gmail.com",
+        "yahoo.com",
+        "outlook.com",
+        "hotmail.com",
+        "icloud.com",
+        "aol.com",
+        "proton.me",
+        "protonmail.com",
+        "zoho.com",
+        "gmx.com",
+        "yandex.com",
+    }
+    suspicious_tlds = {"xyz", "top", "club", "click", "zip", "link"}
+
     # Reputation & abuse signals
     rep = checks.get("emailrep", {}) or {}
-    reputation_score = 100
+    reputation_score = 90
+    if not rep:
+        reputation_score -= 5
     if rep.get("reputation") == "low" or rep.get("suspicious"):
         reputation_score -= 35
     if rep.get("blacklisted"):
@@ -324,30 +343,34 @@ def email_security_score(payload: EmailSecurityRequest) -> SecurityScoreResponse
     # Breach exposure
     leak = checks.get("leakcheck", {}) or {}
     breach_hits = leak.get("found", 0) + len(hibp_result.get("breaches", []) or [])
-    breach_score = max(0, 100 - min(80, breach_hits * 15))
+    breach_score = max(20, 90 - min(80, breach_hits * 20))
 
     # Deliverability & hygiene
     verifier = checks.get("verifier", {}) or {}
-    deliverability_score = 100
+    deliverability_score = 90
+    if not verifier:
+        deliverability_score -= 5
     if verifier.get("status") == "invalid":
         deliverability_score -= 30
     if not verifier.get("deliverable", True):
         deliverability_score -= 40
     if verifier.get("disposable"):
         deliverability_score -= 30
-    if rep.get("free_provider"):
+    if rep.get("free_provider") or domain in free_domains:
         deliverability_score -= 10
     deliverability_score = max(0, deliverability_score)
 
     # Domain security posture
     domain_age_days = rep.get("days_since_domain_creation", 0) or 0
     https_ok = checks.get("https", False)
-    domain_score = 100
+    domain_score = 90
+    if not domain_age_days:
+        domain_score -= 5
     if domain_age_days and domain_age_days < 30:
-        domain_score -= 25
+        domain_score -= 20
     if not https_ok:
-        domain_score -= 25
-    if rep.get("suspicious_tld"):
+        domain_score -= 30
+    if rep.get("suspicious_tld") or tld in suspicious_tlds:
         domain_score -= 15
     domain_score = max(0, domain_score)
 
@@ -391,6 +414,10 @@ def email_security_score(payload: EmailSecurityRequest) -> SecurityScoreResponse
         recommendations.append("Serve mail-related web properties over HTTPS with valid TLS and HSTS.")
     if domain_age_days and domain_age_days < 30:
         recommendations.append("Treat very new domains with heightened scrutiny until reputation matures.")
+    if domain in free_domains:
+        recommendations.append("Use a custom domain for business mail to improve trust and policy control.")
+    if tld in suspicious_tlds:
+        recommendations.append("Consider moving to a reputable TLD to reduce spam/phishing risk perception.")
     if not recommendations:
         recommendations.append("Maintain current controls; monitor reputation and breaches regularly.")
 
