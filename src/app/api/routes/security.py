@@ -1,3 +1,4 @@
+import ipaddress
 import re
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6,7 +7,7 @@ from urllib.parse import urlparse
 
 import httpx
 import requests
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, EmailStr, HttpUrl, Field
 
 from ...core.config import settings
@@ -26,6 +27,7 @@ class SecurityScoreResponse(BaseModel):
     overall_score: float = Field(..., ge=0, le=100)
     components: List[SecurityComponent]
     recommendations: List[str]
+    summary: Optional[str] = None
     breach_findings: Optional[dict] = None
     google_dorks: Optional[Dict[str, str]] = None
     malware_search_urls: Optional[List[str]] = None
@@ -302,27 +304,112 @@ def generate_details(results: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.post("/email", response_model=SecurityScoreResponse, summary="Evaluate email security")
 def email_security_score(payload: EmailSecurityRequest) -> SecurityScoreResponse:
-    """Return security score plus breach OSINT (HIBP if configured)."""
-    base_score = settings.SECURITY_DEFAULT_SCORE
+    """Return an evidence-based email security score with personalized actions."""
+
+    # Run live passive checks
+    checks = run_parallel_checks(payload.email)
+    hibp_result = checks.get("hibp", hibp_email_breach(payload.email, settings.HIBP_API_KEY))
+
+    # Reputation & abuse signals
+    rep = checks.get("emailrep", {}) or {}
+    reputation_score = 100
+    if rep.get("reputation") == "low" or rep.get("suspicious"):
+        reputation_score -= 35
+    if rep.get("blacklisted"):
+        reputation_score -= 25
+    if rep.get("malicious_activity"):
+        reputation_score -= 25
+    reputation_score = max(0, reputation_score)
+
+    # Breach exposure
+    leak = checks.get("leakcheck", {}) or {}
+    breach_hits = leak.get("found", 0) + len(hibp_result.get("breaches", []) or [])
+    breach_score = max(0, 100 - min(80, breach_hits * 15))
+
+    # Deliverability & hygiene
+    verifier = checks.get("verifier", {}) or {}
+    deliverability_score = 100
+    if verifier.get("status") == "invalid":
+        deliverability_score -= 30
+    if not verifier.get("deliverable", True):
+        deliverability_score -= 40
+    if verifier.get("disposable"):
+        deliverability_score -= 30
+    if rep.get("free_provider"):
+        deliverability_score -= 10
+    deliverability_score = max(0, deliverability_score)
+
+    # Domain security posture
+    domain_age_days = rep.get("days_since_domain_creation", 0) or 0
+    https_ok = checks.get("https", False)
+    domain_score = 100
+    if domain_age_days and domain_age_days < 30:
+        domain_score -= 25
+    if not https_ok:
+        domain_score -= 25
+    if rep.get("suspicious_tld"):
+        domain_score -= 15
+    domain_score = max(0, domain_score)
+
     components = [
-        SecurityComponent(name="DMARC", score=base_score * 0.9, description="Placeholder DMARC assessment."),
-        SecurityComponent(name="SPF", score=base_score * 0.85, description="Placeholder SPF assessment."),
-        SecurityComponent(name="Phishing Risk", score=base_score * 0.8, description="Placeholder phishing risk."),
+        SecurityComponent(
+            name="Reputation & Abuse",
+            score=reputation_score,
+            description=(
+                "Reputation from EmailRep including blacklists, malicious activity, and fraud indicators."
+            ),
+        ),
+        SecurityComponent(
+            name="Breach Exposure",
+            score=breach_score,
+            description="Known breach appearances from HIBP and LeakCheck public breach data.",
+        ),
+        SecurityComponent(
+            name="Deliverability & Hygiene",
+            score=deliverability_score,
+            description="SMTP deliverability, disposable usage, and free-provider indicators.",
+        ),
+        SecurityComponent(
+            name="Domain Security",
+            score=domain_score,
+            description="HTTPS availability, domain age, and risky TLD signals.",
+        ),
     ]
-    hibp_result = hibp_email_breach(payload.email, settings.HIBP_API_KEY)
-    overall = sum(component.score for component in components) / len(components)
+
+    overall = round(sum(c.score for c in components) / len(components), 2)
+
+    recommendations: List[str] = []
+    if reputation_score < 80:
+        recommendations.append("Investigate EmailRep reputation issues; remove sources of abuse and request delisting.")
+    if breach_hits > 0:
+        recommendations.append("Force credential resets for breached accounts and enable MFA everywhere.")
+    if deliverability_score < 80:
+        recommendations.append("Set up SPF, DKIM, and DMARC (p=quarantine/reject) to improve trust and delivery.")
+    if verifier.get("disposable"):
+        recommendations.append("Block disposable email usage for account registration and high-risk actions.")
+    if not https_ok:
+        recommendations.append("Serve mail-related web properties over HTTPS with valid TLS and HSTS.")
+    if domain_age_days and domain_age_days < 30:
+        recommendations.append("Treat very new domains with heightened scrutiny until reputation matures.")
+    if not recommendations:
+        recommendations.append("Maintain current controls; monitor reputation and breaches regularly.")
+
+    summary = (
+        f"Overall email risk is {get_risk_level(int(100 - overall)).upper() if overall else 'UNKNOWN'}; "
+        f"breach hits: {breach_hits}, reputation: {rep.get('reputation', 'unknown')}, "
+        f"domain age (days): {domain_age_days or 'n/a'}, HTTPS: {'yes' if https_ok else 'no'}."
+    )
+
     return SecurityScoreResponse(
         target=payload.email,
         kind="email",
-        overall_score=round(overall, 2),
+        overall_score=overall,
         components=components,
-        recommendations=[
-            "Enable DMARC with a reject policy",
-            "Harden SPF and DKIM alignment",
-            "Educate users on phishing detection",
-        ],
+        recommendations=recommendations,
+        summary=summary,
         breach_findings=hibp_result,
         google_dorks=google_dorks_for_email(payload.email),
+        malware_search_urls=malware_search_urls(extract_domain(payload.email)),
     )
 
 
@@ -359,26 +446,80 @@ def analyze_email(payload: EmailSecurityRequest) -> EmailAnalysisResponse:
 
 @router.post("/website", response_model=SecurityScoreResponse, summary="Evaluate website security")
 def website_security_score(payload: WebsiteSecurityRequest) -> SecurityScoreResponse:
-    """Return a placeholder security score for a website URL."""
+    """Return a passive, evidence-based website score with targeted actions."""
+
     url_str = str(payload.url)
     url_clean = url_str[:-1] if url_str.endswith("/") else url_str
-    base_score = settings.SECURITY_DEFAULT_SCORE
+    hostname = _extract_hostname(url_clean)
+
+    resolved_ips = resolve_domain(url_clean)
+    if resolved_ips and all(_is_private_ip(ip) for ip in resolved_ips):
+        raise HTTPException(status_code=400, detail="Only public-facing domains are allowed for scanning.")
+
+    open_ports = probe_open_ports(hostname, COMMON_PORTS) if resolved_ips else []
+    header_check = check_security_headers(url_clean)
+
+    # Component scores
+    dns_score = 100 if resolved_ips else 0
+
+    https_present = any(p["port"] == 443 for p in open_ports) or check_https(hostname)
+    tls_score = 95 if https_present else 45
+
+    header_score = header_check.get("score", 0)
+
+    exposure_penalty = 0
+    for port in open_ports:
+        risk = port.get("risk_level", "MEDIUM")
+        exposure_penalty += 15 if risk == "HIGH" else 8 if risk == "MEDIUM" else 4
+    exposure_score = max(0, 100 - exposure_penalty)
+
     components = [
-        SecurityComponent(name="TLS", score=base_score * 0.92, description="Placeholder TLS assessment."),
-        SecurityComponent(name="Content Security Policy", score=base_score * 0.7, description="Placeholder CSP review."),
-        SecurityComponent(name="Vulnerability Scan", score=base_score * 0.78, description="Placeholder scan summary."),
+        SecurityComponent(
+            name="DNS & Availability",
+            score=dns_score,
+            description="Whether the domain resolves to reachable IPs.",
+        ),
+        SecurityComponent(
+            name="TLS / HTTPS",
+            score=tls_score,
+            description="Presence of HTTPS/TLS on the host (port 443 reachable or HTTPS redirect).",
+        ),
+        SecurityComponent(
+            name="Security Headers",
+            score=header_score,
+            description="Coverage of key headers: HSTS, CSP, XFO, XCTO, Referrer-Policy.",
+        ),
+        SecurityComponent(
+            name="Service Exposure",
+            score=exposure_score,
+            description="Impact of exposed services/ports observed during passive probing.",
+        ),
     ]
-    overall = sum(component.score for component in components) / len(components)
+
+    overall = round(sum(c.score for c in components) / len(components), 2)
+
+    vulnerabilities = derive_vulnerabilities(open_ports, header_check, resolved_ips)
+    recommendations = build_recommended_actions(vulnerabilities, header_check)
+    if not https_present:
+        recommendations.append("Obtain a trusted TLS certificate and enforce HTTPS with HSTS.")
+    if header_check.get("missing"):
+        recommendations.append(
+            "Add missing security headers (HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy)."
+        )
+
+    summary = (
+        f"Risk: {overall_risk_from_score(int(overall)).upper()} — DNS:{'ok' if resolved_ips else 'fail'}; "
+        f"TLS:{'yes' if https_present else 'no'}; headers score:{header_score}; "
+        f"open ports:{len(open_ports)}; missing headers:{len(header_check.get('missing', []))}."
+    )
+
     return SecurityScoreResponse(
         target=url_clean,
         kind="website",
-        overall_score=round(overall, 2),
+        overall_score=overall,
         components=components,
-        recommendations=[
-            "Force HTTPS and HSTS",
-            "Deploy a strict Content Security Policy",
-            "Run routine vulnerability scans",
-        ],
+        recommendations=recommendations,
+        summary=summary,
         google_dorks=generate_google_dorks_for_domain(url_clean),
         malware_search_urls=malware_search_urls(url_clean),
     )
@@ -461,6 +602,14 @@ def probe_open_ports(hostname: str, ports: Dict[int, str]) -> List[dict]:
         except (socket.timeout, ConnectionRefusedError, OSError):
             continue
     return open_ports
+
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local
+    except ValueError:
+        return True
 
 
 def check_security_headers(url: str) -> dict:
@@ -609,12 +758,19 @@ def website_passive_assessment(payload: WebsiteAssessmentRequest) -> dict:
     url_clean = url_str[:-1] if url_str.endswith("/") else url_str
     hostname = _extract_hostname(url_clean)
     resolved_ips = resolve_domain(url_clean)
+    if resolved_ips and all(_is_private_ip(ip) for ip in resolved_ips):
+        raise HTTPException(status_code=400, detail="Only public-facing domains are allowed for scanning.")
     open_ports = probe_open_ports(hostname, COMMON_PORTS) if resolved_ips else []
     header_check = check_security_headers(url_clean)
     vulnerabilities = derive_vulnerabilities(open_ports, header_check, resolved_ips)
     score = compute_security_score(open_ports, header_check, resolved_ips)
     risk = overall_risk_from_score(score)
     actions = build_recommended_actions(vulnerabilities, header_check)
+
+    summary = (
+        f"Risk {risk}; score {score}. Resolved IPs: {len(resolved_ips)}; "
+        f"open ports: {len(open_ports)}; missing headers: {len(header_check.get('missing', []))}."
+    )
 
     return {
         "url": url_clean,
@@ -623,6 +779,7 @@ def website_passive_assessment(payload: WebsiteAssessmentRequest) -> dict:
         "security_score": score,
         "overall_risk": risk,
         "recommended_actions": actions,
+        "summary": summary,
         "google_dorks": generate_google_dorks_for_domain(url_clean),
         "malware_search_urls": malware_search_urls(url_clean),
         "disclaimer": "Results are based on passive analysis of publicly accessible information.",
