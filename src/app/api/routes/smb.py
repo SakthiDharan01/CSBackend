@@ -12,7 +12,7 @@ import pandas as pd
 import requests
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, EmailStr, Field
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import letter
@@ -43,14 +43,20 @@ class AssetData(BaseModel):
 
 
 class SMBReportDataRequest(BaseModel):
-    company_name: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    company_name: str = Field(..., alias=AliasChoices("company_name", "companyName"))
     industry: str
-    employee_count: str
-    contact_name: str
-    contact_email: EmailStr
-    security_priorities: List[str]
-    employees_data: List[EmployeeData]
-    assets_data: List[AssetData]
+    employee_count: str = Field(..., alias=AliasChoices("employee_count", "employeeCount"))
+    contact_name: str = Field(..., alias=AliasChoices("contact_name", "contactName"))
+    contact_email: EmailStr = Field(..., alias=AliasChoices("contact_email", "contactEmail"))
+    security_priorities: List[str] = Field(default_factory=list, alias=AliasChoices("security_priorities", "securityPriorities"))
+    employees_data: Optional[List[EmployeeData]] = Field(
+        default=None, alias=AliasChoices("employees_data", "employees", "employeesData")
+    )
+    assets_data: Optional[List[AssetData]] = Field(
+        default=None, alias=AliasChoices("assets_data", "assets", "assetsData")
+    )
 
 
 class SMBReportResponse(BaseModel):
@@ -504,13 +510,14 @@ async def generate_smb_report_from_csv(
     description="Accepts employee and asset lists (JSON), performs passive checks, and returns report metadata.",
 )
 async def generate_smb_report_from_json(payload: SMBReportDataRequest, background_tasks: BackgroundTasks):
-    if not payload.employees_data:
-        raise HTTPException(status_code=400, detail="At least one employee is required")
-    if not payload.assets_data:
-        raise HTTPException(status_code=400, detail="At least one asset is required")
+    employees_data = payload.employees_data or []
+    assets_data = payload.assets_data or []
+
+    if not employees_data and not assets_data:
+        raise HTTPException(status_code=400, detail="Provide at least one employee or asset to assess")
 
     email_results = []
-    for employee in payload.employees_data:
+    for employee in employees_data:
         result = await check_email_breach(employee.email)
         result["name"] = employee.name
         result["role"] = employee.role
@@ -518,7 +525,7 @@ async def generate_smb_report_from_json(payload: SMBReportDataRequest, backgroun
         await asyncio.sleep(0.2)
 
     asset_results = []
-    for asset in payload.assets_data:
+    for asset in assets_data:
         ssl_check, headers_check, vt_check = await asyncio.gather(
             check_ssl_certificate(asset.url),
             check_security_headers(asset.url),
@@ -535,6 +542,18 @@ async def generate_smb_report_from_json(payload: SMBReportDataRequest, backgroun
         )
         await asyncio.sleep(0.2)
 
+    scan_summary = {
+        "total_employees": len(employees_data),
+        "total_assets": len(assets_data),
+        "breached_emails": sum(1 for e in email_results if e.get("is_breached")),
+        "insecure_assets": sum(1 for a in asset_results if not a["ssl"].get("has_ssl")),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "company_name": payload.company_name,
+        "industry": payload.industry,
+        "contact_name": payload.contact_name,
+        "contact_email": payload.contact_email,
+    }
+
     report_data = {
         "company_info": {
             "name": payload.company_name,
@@ -544,13 +563,7 @@ async def generate_smb_report_from_json(payload: SMBReportDataRequest, backgroun
             "email": payload.contact_email,
             "security_priorities": payload.security_priorities,
         },
-        "scan_summary": {
-            "total_employees": len(payload.employees_data),
-            "total_assets": len(payload.assets_data),
-            "breached_emails": sum(1 for e in email_results if e.get("is_breached")),
-            "insecure_assets": sum(1 for a in asset_results if not a["ssl"].get("has_ssl")),
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        },
+        "scan_summary": scan_summary,
         "email_findings": email_results,
         "asset_findings": asset_results,
         "google_dorks": generate_google_dorks(payload.company_name),
@@ -565,7 +578,7 @@ async def generate_smb_report_from_json(payload: SMBReportDataRequest, backgroun
         "status": "success",
         "report_id": report_id,
         "download_url": f"/smb/download/{report_id}",
-        "summary": report_data["scan_summary"],
+        "summary": scan_summary,
         "message": "Report generation started",
     }
 
