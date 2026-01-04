@@ -1,5 +1,5 @@
 from functools import lru_cache
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -9,10 +9,10 @@ class Settings(BaseSettings):
     VERSION: str = "0.1.0"
     SECURITY_DEFAULT_SCORE: float = 75.0
     SMB_DEFAULT_RISK_LEVEL: str = "low"
+    VIRUSTOTAL_API_KEY: str = ""
+    HIBP_API_KEY: str = ""
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 @lru_cache()

@@ -38,3 +38,31 @@ def test_smb_report_generation():
     assert body["status"] == "generated"
     assert body["risk_level"]
     assert body["report_id"]
+
+
+def test_email_analyze_endpoint_structure():
+    payload = {"email": "test@example.com"}
+    response = client.post("/security_score/email/analyze", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["email"] == payload["email"]
+    assert "risk_score" in body
+    assert body["risk_level"] in {"Low", "Medium", "High", "Critical"}
+    assert isinstance(body.get("flags", []), list)
+    assert isinstance(body.get("details", {}), dict)
+    assert isinstance(body.get("sources", {}), dict)
+
+
+def test_website_passive_assessment():
+    payload = {"url": "https://example.com"}
+    response = client.post("/security_score/assessment", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["url"] == payload["url"]
+    assert isinstance(body["open_ports"], list)
+    assert isinstance(body["possible_vulnerabilities"], list)
+    assert 0 <= body["security_score"] <= 100
+    assert body["overall_risk"] in {"LOW", "MEDIUM", "HIGH"}
+    assert isinstance(body["recommended_actions"], list)
+    assert "disclaimer" in body
